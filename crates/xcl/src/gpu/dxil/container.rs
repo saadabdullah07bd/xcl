@@ -205,7 +205,7 @@ pub fn container(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, ps
         (*b"DXIL", program_part(stage, sm, dxil_version, bitcode)),
     ];
     let header = 32 + 4 * parts.len();
-    let total: usize = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+    let total: usize = header + parts.iter().map(|(_, d)| (8 + d.len() + 3) & !3).sum::<usize>();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(b"DXBC");
     out.extend_from_slice(&[0; 16]);
@@ -216,12 +216,15 @@ pub fn container(stage: Stage, sm: (u32, u32), bitcode: &[u8], features: u64, ps
     let mut off = header;
     for (_, d) in &parts {
         out.extend_from_slice(&(off as u32).to_le_bytes());
-        off += 8 + d.len();
+        off += (8 + d.len() + 3) & !3;
     }
     for (cc, d) in &parts {
         out.extend_from_slice(cc);
         out.extend_from_slice(&(d.len() as u32).to_le_bytes());
         out.extend_from_slice(d);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
     }
     let digest = hash(&out[20..]);
     out[4..20].copy_from_slice(&digest);
@@ -421,7 +424,7 @@ pub fn container_with_signatures(stage: Stage, sm: (u32, u32), bitcode: &[u8], f
     parts.push((*b"PSV0", psv));
     parts.push((*b"DXIL", program_part(stage, sm, dxil_version, bitcode)));
     let header = 32 + 4 * parts.len();
-    let total: usize = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+    let total: usize = header + parts.iter().map(|(_, d)| (8 + d.len() + 3) & !3).sum::<usize>();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(b"DXBC");
     out.extend_from_slice(&[0; 16]);
@@ -432,12 +435,15 @@ pub fn container_with_signatures(stage: Stage, sm: (u32, u32), bitcode: &[u8], f
     let mut off = header;
     for (_, d) in &parts {
         out.extend_from_slice(&(off as u32).to_le_bytes());
-        off += 8 + d.len();
+        off += (8 + d.len() + 3) & !3;
     }
     for (cc, d) in &parts {
         out.extend_from_slice(cc);
         out.extend_from_slice(&(d.len() as u32).to_le_bytes());
         out.extend_from_slice(d);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
     }
     let digest = hash(&out[20..]);
     out[4..20].copy_from_slice(&digest);
