@@ -1102,7 +1102,12 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        crate::xlog_warn!("title_textures: read_committed failed to allocate {len} bytes (OOM resilient)");
+        return out;
+    }
+    out.resize(len, 0);
     let Some(limit) = at.checked_add(len) else { return out };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)

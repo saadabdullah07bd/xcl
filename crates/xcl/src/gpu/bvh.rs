@@ -253,9 +253,9 @@ pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> 
     let q = cross(sv, e1);
     let (i, j, t) = (dot(sv, p), dot(d, q), dot(e2, q));
     let hit = if det > 0.0 {
-        i >= 0.0 && j >= 0.0 && i + j <= det
+        i >= 0.0 && j >= 0.0 && i + j <= det && t >= 0.0
     } else {
-        det < 0.0 && i <= 0.0 && j <= 0.0 && i + j >= det
+        det < 0.0 && i <= 0.0 && j <= 0.0 && i + j >= det && t <= 0.0
     };
     hit.then_some([t, det, i, j])
 }
@@ -289,6 +289,7 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
     match node & 7 {
         4 | BOX32 => {
             let mut hits = [(f32::INFINITY, INVALID); 4];
+            let inv_c = inv.map(|x| x.max(-f32::MAX).min(f32::MAX));
             for (k, h) in hits.iter_mut().enumerate() {
                 let child = word(data, at + 4 * k);
                 let (mn, mx) = if node & 7 == BOX32 {
@@ -297,25 +298,18 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                     let w = [0, 1, 2].map(|j| word(data, at + 16 + 12 * k + 4 * j));
                     ([half(w[0]), half(w[0] >> 16), half(w[1])], [half(w[1] >> 16), half(w[2]), half(w[2] >> 16)])
                 };
-                let valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
-                let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
+                let valid = child != INVALID && !mn[0].is_nan() && (0..3).all(|a| mn[a] <= mx[a]);
+                let (mut near, mut far) = ([0.0f32; 3], [0.0f32; 3]);
                 for axis in 0..3 {
-                    let (lo, hi) = if inv[axis].is_infinite() {
-                        if o[axis] >= mn[axis] && o[axis] <= mx[axis] {
-                            (f32::NEG_INFINITY, f32::INFINITY)
-                        } else {
-                            (f32::INFINITY, f32::NEG_INFINITY)
-                        }
-                    } else {
-                        let t1 = (mn[axis] - o[axis]) * inv[axis];
-                        let t2 = (mx[axis] - o[axis]) * inv[axis];
-                        (t1.min(t2), t1.max(t2))
-                    };
-                    a = a.max(lo);
-                    b = b.min(hi);
+                    let low = (mn[axis] - o[axis]) * inv_c[axis];
+                    let high = (mx[axis] - o[axis]) * inv_c[axis];
+                    near[axis] = low.min(high);
+                    far[axis] = low.max(high);
                 }
-                if valid && a <= b && b >= 0.0 && a <= tmax {
-                    *h = (a, child);
+                let enter = near[0].max(near[1]).max(near[2]);
+                let leave = far[0].min(far[1]).min(far[2]);
+                if valid && leave >= enter.max(0.0) && enter < tmax {
+                    *h = (enter, child);
                 }
             }
             if sort {

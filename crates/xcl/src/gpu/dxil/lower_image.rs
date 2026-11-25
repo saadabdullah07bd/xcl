@@ -227,15 +227,19 @@ impl Lw {
             let c1 = lw.fcmp(Pred::FOGe, i, z);
             let c2 = lw.fcmp(Pred::FOGe, j, z);
             let c3 = lw.fcmp(Pred::FOLe, ij, det);
+            let tp = lw.fcmp(Pred::FOGe, t, z);
             let hp = lw.land(c1, c2);
             let hp = lw.land(hp, c3);
+            let hp = lw.land(hp, tp);
             let dneg = lw.fcmp(Pred::FOLt, det, z);
             let n1 = lw.fcmp(Pred::FOLe, i, z);
             let n2 = lw.fcmp(Pred::FOLe, j, z);
             let n3 = lw.fcmp(Pred::FOGe, ij, det);
+            let tn = lw.fcmp(Pred::FOLe, t, z);
             let hn = lw.land(dneg, n1);
             let hn = lw.land(hn, n2);
             let hn = lw.land(hn, n3);
+            let hn = lw.land(hn, tn);
             let hit = lw.sel(dpos, hp, hn);
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
@@ -349,31 +353,27 @@ impl Lw {
                 ([fl(self, k + 4), fl(self, k + 5), fl(self, k + 6)], [fl(self, k + 7), fl(self, k + 8), fl(self, k + 9)])
             };
             let (d0, d1) = (self.sreg(srsrc), self.sreg(srsrc + 1));
-            // address: ((d1 & 0xFF) << 32 | d0) << 8 + node offset (8-byte units); low 32 bits
+            // address: (((d1 & 0xFF) << 32 | d0) << 8) + (((node_hi << 32 | (node & !7)) << 3)
+            let d1lo = self.andc(d1, 0xFF);
+            let b64 = self.pack64(d0, d1lo);
+            let k8 = self.c64(8);
+            let b64 = self.bin(BinOp::Shl, b64, k8);
             let nlo = self.andc(node, !7);
-            let base_lo = self.shlc(d0, 8);
-            let off_lo = self.shlc(nlo, 3);
-            let a = self.add(base_lo, off_lo);
-            // the window: bits 32.. of the 64-bit address
+            let nlo64 = self.zext64(nlo);
+            let off = match node_hi {
+                Some(hi) => {
+                    let h64 = self.zext64(hi);
+                    let k32 = self.c64(32);
+                    let h64 = self.bin(BinOp::Shl, h64, k32);
+                    self.or(h64, nlo64)
+                }
+                None => nlo64,
+            };
+            let k3 = self.c64(3);
+            let off = self.bin(BinOp::Shl, off, k3);
+            let full = self.add(b64, off);
+            let (a, hi) = self.unpack64(full);
             if self.mems.len() > 1 {
-                let d1lo = self.andc(d1, 0xFF);
-                let b64 = self.pack64(d0, d1lo);
-                let k8 = self.c64(8);
-                let b64 = self.bin(BinOp::Shl, b64, k8);
-                let nlo64 = self.zext64(nlo);
-                let off = match node_hi {
-                    Some(hi) => {
-                        let h64 = self.zext64(hi);
-                        let k32 = self.c64(32);
-                        let h64 = self.bin(BinOp::Shl, h64, k32);
-                        self.or(h64, nlo64)
-                    }
-                    None => nlo64,
-                };
-                let k3 = self.c64(3);
-                let off = self.bin(BinOp::Shl, off, k3);
-                let full = self.add(b64, off);
-                let (_, hi) = self.unpack64(full);
                 self.window_hi(hi, false);
             }
             let ty = self.andc(node, 7);

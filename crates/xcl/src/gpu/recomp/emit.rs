@@ -5777,19 +5777,17 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
     if (type == 4u || type == 5u) {
         uint4 child = mem.Load4(at);
         float tn[4]; uint id[4];
-        float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
+        float3 inv_c = clamp(inv, -3.402823466e+38f, 3.402823466e+38f);
         [unroll] for (uint k = 0u; k < 4u; k++) {
             float3 mn, mx;
             if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
             else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
-            float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
-            bool3 in_slab = and(o >= mn, o <= mx);
-            float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
-            float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
-            float a = max(max(lo.x, lo.y), lo.z);
-            float b = min(min(hi.x, hi.y), hi.z);
-            bool valid = and(child[k] != 0xFFFFFFFFu, all(mn <= mx));
-            bool hit = and(and(valid, a <= b), and(b >= 0.0f, a <= tmax));
+            float3 t1 = (mn - o) * inv_c, t2 = (mx - o) * inv_c;
+            float3 near = min(t1, t2), far = max(t1, t2);
+            float a = max(max(near.x, near.y), near.z);
+            float b = min(min(far.x, far.y), far.z);
+            bool valid = and(child[k] != 0xFFFFFFFFu, and(!isnan(mn.x), all(mn <= mx)));
+            bool hit = and(valid, and(b >= max(a, 0.0f), a < tmax));
             tn[k] = hit ? a : asfloat(0x7F800000u);
             id[k] = hit ? child[k] : 0xFFFFFFFFu;
         }
@@ -5813,8 +5811,8 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
         float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
-        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
-        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); ahead when t has same sign as det
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det && t >= 0.0f) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det && t <= 0.0f);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);

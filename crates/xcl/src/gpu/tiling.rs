@@ -367,7 +367,13 @@ impl Chain {
     pub fn detile_volume(&self, mem: &[u8], i: usize) -> Vec<u8> {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * l.depth * e];
+        let needed = l.width * l.height * l.depth * e;
+        let mut out = Vec::new();
+        if out.try_reserve_exact(needed).is_err() {
+            crate::xlog_warn!("tiling: detile_volume failed to allocate {needed} bytes (OOM resilient)");
+            return Vec::new();
+        }
+        out.resize(needed, 0);
         for z in 0..l.depth {
             for y in 0..l.height {
                 for x in 0..l.width {
@@ -401,7 +407,13 @@ impl Chain {
         let l = self.levels[i];
         let t = &self.layout;
         let e = 1usize << t.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * e];
+        let needed = l.width * l.height * e;
+        let mut out = Vec::new();
+        if out.try_reserve_exact(needed).is_err() {
+            crate::xlog_warn!("tiling: detile_level failed to allocate {needed} bytes for level {i} (OOM resilient)");
+            return Vec::new();
+        }
+        out.resize(needed, 0);
         if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
             // linear: a row's elements are contiguous, so it is copied whole (the elements that
             // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
