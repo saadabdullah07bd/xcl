@@ -43,6 +43,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         VirtualFreeEx,
         VirtualProtect,
         VirtualProtectEx,
+        VirtualQuery,
+        VirtualQueryEx,
         XMemAlloc,
         XMemFree,
         XMemAllocDefault,
@@ -56,6 +58,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
+        XMemIsToolsMemAvailable,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -69,6 +72,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetUnhandledExceptionFilter,
+        Sleep,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
@@ -181,6 +185,12 @@ pub mod mirrors {
     }
     static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
 
+    /// Whether `(t, p)` is a CPU-inaccessible GPU-view alias reservation (`MEM_64K_PAGES`
+    /// reserve with `PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS`).
+    pub fn is_gpu_view_reservation(t: u32, p: u32) -> bool {
+        t & PAGES_64K == PAGES_64K && t & 0x1000 == 0 && p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS
+    }
+
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
     pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
         if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
@@ -244,13 +254,17 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
     }
-    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
-    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them.
+    // Skip CPU-inaccessible GPU-view mirror reservations (`PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS`):
+    // their pixels live in the paired CPU view (`mirrors::source`), so putting them in sparse VA
+    // wastes sparse address space and write-watch overhead while still needing mirror pairing.
+    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES && !mirrors::is_gpu_view_reservation(t, p) {
         if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -273,7 +287,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q as *mut c_void;
         }
     }
-    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 && !mirrors::is_gpu_view_reservation(t, p) {
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
@@ -284,10 +298,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             uma.and_then(|u| u.sparse_reserve(size))
         };
         if let Some(q) = reserved {
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
@@ -313,7 +329,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             // a pool of their own)
             const KEEP: usize = 96 << 20;
             let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-            if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
+            if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
@@ -430,6 +446,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         if release {
             u.sparse_release(a);
+            mirrors::released(a);
         }
         return 1;
     }
@@ -641,6 +658,56 @@ pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize,
     VirtualAlloc(addr, size, t, p)
 }
 
+/// Fast-path `VirtualQuery` / `VirtualQueryEx` / `XMemVirtualQuery` for a committed coherent
+/// UMA window: `OpenExistingHeapFromAddress` makes a kernel `VirtualQuery` on a 4 GiB coherent
+/// window walk the whole region (~75–80 ms, holding `MmLockAddressSpace`), stalling
+/// `GetWriteWatch` on other threads. A committed coherent window is `PAGE_READWRITE` as a whole.
+unsafe fn query_committed_window(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> Option<usize> {
+    let need = std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>();
+    if mbi.is_null() || len < need {
+        return None;
+    }
+    let addr = address as usize;
+    let u = crate::gpu::uma::get()?;
+    if !u.in_committed_window(addr, 1) {
+        return None;
+    }
+    let k = u.window_of(addr)?;
+    let (win_base, win_len) = u.window(k);
+    let page_base = addr & !0xFFF;
+    mbi.write_unaligned(mem::MEMORY_BASIC_INFORMATION {
+        BaseAddress: page_base as *mut c_void,
+        AllocationBase: win_base as *mut c_void,
+        AllocationProtect: mem::PAGE_READWRITE,
+        PartitionId: 0,
+        RegionSize: (win_base + win_len).saturating_sub(page_base),
+        State: mem::MEM_COMMIT,
+        Protect: mem::PAGE_READWRITE,
+        Type: mem::MEM_PRIVATE,
+    });
+    Some(need)
+}
+
+fn is_current_process(process: HANDLE) -> bool {
+    process == (-1isize as HANDLE) || process == unsafe { thr::GetCurrentProcess() }
+}
+
+pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if let Some(n) = query_committed_window(address, mbi, len) {
+        return n;
+    }
+    mem::VirtualQuery(address, mbi, len)
+}
+
+pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if is_current_process(process) {
+        if let Some(n) = query_committed_window(address, mbi, len) {
+            return n;
+        }
+    }
+    mem::VirtualQueryEx(process, address, mbi, len)
+}
+
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
 /// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
 /// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
@@ -651,6 +718,10 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
         return 0;
     }
     let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
+    if is_current_process(process) && query_committed_window(address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()).is_some() {
+        *(info as *mut u8).add(48).cast::<u32>() = 1;
+        return 1;
+    }
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
@@ -776,6 +847,12 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
     }
     std::ptr::write_bytes((buf as *mut u8).add(8), 0, 32);
     1
+}
+
+/// `BOOL XMemIsToolsMemAvailable()`: whether tooling (debug) memory is available on the console.
+/// Returns FALSE (0) in retail title execution.
+pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    0
 }
 
 /// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
@@ -997,6 +1074,9 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
 /// Whether all of `[a, a + len)` is committed: one VirtualQuery per run of pages in one state
 /// (page by page each asked walked the rest of the run).
 fn committed_range(a: usize, len: usize) -> bool {
+    if len > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, len)) {
+        return true;
+    }
     let mut p = a;
     while p < a + len {
         let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1027,6 +1107,9 @@ struct StateRun {
 fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
     if (run.start..run.end).contains(&a) {
         return run.committed;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, 1)) {
+        return true;
     }
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
@@ -1377,6 +1460,56 @@ fn hresult_to_win32(hr: i32) -> u32 {
         hr as u32 & 0xFFFF
     } else {
         fnd::ERROR_INVALID_PARAMETER
+    }
+}
+
+/// a sleep is taken in steps of at most this, so that time held from then on is not counted
+const SLEEP_STEP_MS: u32 = 20;
+/// how often a sleep looks whether the title is still held
+const SLEEP_HELD_POLL_MS: u32 = 5;
+/// the shortest sleep that is a wait for time: a shorter one is a poll and is passed on as it is
+const SLEEP_HOLD_MIN_MS: u32 = 100;
+
+/// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
+/// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
+/// title never waits there. A retail title's own stall check – a thread that ticks once a second
+/// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
+/// while the driver built the pipelines of its world (#505, #232). Only a sleep of
+/// `SLEEP_HOLD_MIN_MS` or more is taken so: a thread that polls with short sleeps (streaming,
+/// sound) goes on while a bind waits. `XCL_SLEEP_HOLD=<ms>` sets that length, `0`: the PC's
+/// Sleep as it is.
+pub unsafe extern "system" fn Sleep(ms: u32) {
+    static MIN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(min) = *MIN.get_or_init(|| sleep_hold_min(std::env::var("XCL_SLEEP_HOLD").ok().as_deref())) else {
+        return thr::Sleep(ms);
+    };
+    title_sleep(ms, min, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+}
+
+/// `XCL_SLEEP_HOLD`: the shortest sleep whose held time is not counted (`None`: no sleep).
+fn sleep_hold_min(v: Option<&str>) -> Option<u32> {
+    match v.map(str::trim) {
+        None => Some(SLEEP_HOLD_MIN_MS),
+        Some("0") => None,
+        Some(v) => Some(v.parse().unwrap_or(SLEEP_HOLD_MIN_MS)),
+    }
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield, an endless
+/// sleep and one shorter than `min` as they are).
+fn title_sleep(ms: u32, min: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE || ms < min {
+        return sleep(ms);
+    }
+    let mut left = std::time::Duration::from_millis(ms as u64);
+    while !left.is_zero() {
+        if held() {
+            sleep(SLEEP_HELD_POLL_MS);
+            continue;
+        }
+        let t = std::time::Instant::now();
+        sleep((left.as_millis() as u32).clamp(1, SLEEP_STEP_MS));
+        left = left.saturating_sub(t.elapsed());
     }
 }
 
@@ -1898,6 +2031,88 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_sleep(ms: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// A title's Sleep does not count the time the title is held (a bind waiting for a pipeline
+    /// still being built): it returns once that is over and its own time has gone by after it.
+    #[test]
+    fn a_sleep_does_not_count_the_time_the_title_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(60, 60, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
+    }
+
+    /// Time held from the middle of a sleep on is not counted either (but for the step under way).
+    #[test]
+    fn a_sleep_stops_counting_when_the_title_gets_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(50);
+                held.store(true, Ordering::Release);
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(200, SLEEP_HOLD_MIN_MS, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        // 200 ms of its own, less at most one step counted while held, and the 300 ms held
+        assert!(took >= std::time::Duration::from_millis(200 + 300 - SLEEP_STEP_MS as u64 - 15), "back after {took:?}");
+    }
+
+    /// With the title not held a sleep takes its time, in steps; a yield and an endless sleep
+    /// are passed on as they are.
+    #[test]
+    fn a_sleep_of_a_title_not_held_takes_its_time() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| {
+            calls.borrow_mut().push(ms);
+            if ms != 0 && ms != thr::INFINITE {
+                real_sleep(ms);
+            }
+        };
+        title_sleep(0, 1, sleep, || false);
+        title_sleep(thr::INFINITE, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
+        calls.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        title_sleep(50, 1, sleep, || false);
+        let took = t.elapsed();
+        assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
+        assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
+        // a sleep shorter than a step is one sleep, as before
+        calls.borrow_mut().clear();
+        title_sleep(1, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [1]);
+    }
+
+    /// A sleep shorter than the shortest one held is a poll: it is passed on as it is, also
+    /// while the title is held. `XCL_SLEEP_HOLD` sets that length, `0` takes no sleep.
+    #[test]
+    fn a_short_sleep_is_passed_on_while_the_title_is_held() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| calls.borrow_mut().push(ms);
+        title_sleep(SLEEP_HOLD_MIN_MS - 1, SLEEP_HOLD_MIN_MS, sleep, || true);
+        assert_eq!(*calls.borrow(), [SLEEP_HOLD_MIN_MS - 1]);
+        assert_eq!(sleep_hold_min(None), Some(SLEEP_HOLD_MIN_MS));
+        assert_eq!(sleep_hold_min(Some("0")), None);
+        assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
+        assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {
@@ -2535,6 +2750,11 @@ mod tests {
     }
 
     #[test]
+    fn xmem_is_tools_mem_available_returns_false() {
+        assert_eq!(unsafe { XMemIsToolsMemAvailable() }, 0);
+    }
+
+    #[test]
     fn get_proc_address_and_load_library_ex_reject_null_name() {
         unsafe {
             let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
@@ -2804,5 +3024,60 @@ mod tests {
         let stub_h = modules::hle_handle("unit_stub_probe.dll");
         assert_ne!(stub_h, 0);
         assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
+    }
+
+    #[test]
+    fn virtual_query_fastpath_covers_committed_coherent_window() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let Some(k) = u.committed_window() else { return };
+        let (base, len) = u.window(k);
+        assert!(len >= 0x2000);
+        let addr = (base + 0x1234) as *const c_void;
+        unsafe {
+            let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n = VirtualQuery(addr, &mut mbi, std::mem::size_of_val(&mbi));
+            assert_eq!(n, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>());
+            assert_eq!(mbi.BaseAddress as usize, base + 0x1000);
+            assert_eq!(mbi.AllocationBase as usize, base);
+            assert_eq!(mbi.RegionSize, len - 0x1000);
+            assert_eq!(mbi.State, mem::MEM_COMMIT);
+            assert_eq!(mbi.Protect, mem::PAGE_READWRITE);
+
+            let mut mbi2: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n2 = VirtualQueryEx(thr::GetCurrentProcess(), addr, &mut mbi2, std::mem::size_of_val(&mbi2));
+            assert_eq!(n2, n);
+            assert_eq!(mbi2.RegionSize, mbi.RegionSize);
+
+            let mut xinfo = [0u8; 64];
+            assert_eq!(XMemVirtualQuery(thr::GetCurrentProcess(), addr, xinfo.as_mut_ptr() as *mut c_void), 1);
+            assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 1);
+            assert!(committed_range(base + 0x1000, 0x1000));
+            assert!(committed_page(base + 0x1000));
+        }
+    }
+
+    #[test]
+    fn sparse_64k_reservation_registers_gpu_view_mirror_and_releases_cleanly() {
+        unsafe {
+            // Reserve a 64 KiB-page CPU view (lands in sparse UMA when space is available) and
+            // pair it with a PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS GPU view of the same size.
+            let size = 4 << 20;
+            let cpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_READWRITE);
+            assert!(!cpu.is_null());
+            let gpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_NOACCESS | 0x800);
+            assert!(!gpu.is_null());
+            assert_eq!(
+                mirrors::source(gpu as usize + 0x2_0000),
+                Some(cpu as usize + 0x2_0000),
+                "GPU view must resolve to CPU view even when CPU view lives in sparse UMA"
+            );
+            // GPU-view alias must not consume sparse UMA VA.
+            if let Some(u) = crate::gpu::uma::get() {
+                assert!(!u.is_sparse(gpu as usize), "CPU-inaccessible GPU view should stay outside sparse UMA");
+            }
+            assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
+            assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
+        }
     }
 }

@@ -258,6 +258,23 @@ mod version_tests {
         assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
     }
 
+    #[test]
+    fn a_source_compiled_at_o0_has_no_debug_noops() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let src = "RWByteAddressBuffer m : register(u0);\n[numthreads(1, 1, 1)] void main() { uint a = m.Load(0); uint b = a + 1u; m.Store(4, b); }\n";
+        let padded = format!("{src}{}", " ".repeat(8 * 1024 * 1024));
+        let with_noops = compile(src, "main", "cs_6_6", &["-O0"]).unwrap();
+        let without = compile(src, "main", "cs_6_6", &["-O0", "-opt-disable", "debug-nops"]).unwrap();
+        if without.len() == with_noops.len() {
+            println!("this DXC has no debug-nops switch");
+            return;
+        }
+        assert_eq!(compile(&padded, "main", "cs_6_6", &[]).unwrap().len(), without.len());
+    }
+
     /// The DXC of this PC, when it has one: what `report.json` says of it.
     #[test]
     fn the_loaded_dxc_is_identified() {
@@ -370,7 +387,16 @@ struct Job {
     profile: String,
     extra: Vec<String>,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    /// one of the title's threads waits for it
+    wanted: Wanted,
 }
+
+/// Whether one of the title's threads waits for a compile (asked again while it is held back).
+pub type Wanted = Box<dyn Fn() -> bool + Send>;
+
+/// Compiles the title waits for that go on at once however little commit is left (each takes
+/// 0.1 – 0.7 GB).
+const WANTED_AT_ONCE: usize = 6;
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
@@ -411,8 +437,11 @@ impl Drop for MemorySlot {
 /// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
 /// time – it goes when no other is running (and after a minute in any case). Each compile used
 /// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
-/// left, and its last cold-cache shaders came a few a minute.
-pub fn wait_for_memory() -> MemorySlot {
+/// left, and its last cold-cache shaders came a few a minute. One that the title waits for
+/// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
+/// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
+/// ended it.
+pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
@@ -421,7 +450,7 @@ pub fn wait_for_memory() -> MemorySlot {
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 {
+        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
@@ -446,7 +475,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory();
+                let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -460,7 +489,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
@@ -477,7 +506,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
         if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
+            args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
         }

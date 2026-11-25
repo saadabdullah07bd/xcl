@@ -48,7 +48,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
+| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
@@ -63,6 +63,9 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
+Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
+An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
+
 ### Media and tools
 
 | Feature | State | What it does | Verified by |
@@ -76,6 +79,9 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+- **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
+  when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
+  `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
@@ -105,7 +111,9 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
-  can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+  can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
+  made up of complete native waves can use the per-lane form for branches on whole-wave masks.
+  Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
@@ -114,9 +122,17 @@ xcl inspect D:\Game\game.exe               # the game's imports and what XCL has
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
+xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+- **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
+  blob is left to the runtime instead of being compiled in the pass — those compiles take tens
+  of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
+  sets the cap in KiB (0 turns it off).
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
@@ -125,6 +141,24 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
+  background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
+  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
+  they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
+  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
+  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
+  ones with `record HASH`, the console record's hash that `--measure-pso` and
+  `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
+  `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
+  logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
+  0x…`): its dispatches are skipped.
+- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
+  those on which the GPU completed at least one operation.
+- `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
+  requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
+  (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
